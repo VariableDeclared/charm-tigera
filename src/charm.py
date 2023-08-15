@@ -19,6 +19,7 @@ import pathlib
 import tempfile
 import time
 import traceback
+from enum import Enum
 from base64 import b64decode
 from subprocess import check_output
 
@@ -40,6 +41,8 @@ TIGERA_DISTRO_VERSIONS = {"1.26": "3.16.1", "1.25": "3.15.2"}
 KUBECONFIG_PATH = "/root/.kube/config"
 PLUGINS_PATH = "/usr/local/bin"
 
+class TigeraFeatures(Enum):
+    EARLY_NETWORKING = "early-networking"
 
 log = logging.getLogger(__name__)
 
@@ -198,29 +201,12 @@ class TigeraCharm(CharmBase):
         except ValueError:
             self.unit.status = BlockedStatus("Pod-to-Pod configuration is not valid CIDR")
             return False
-        try:
-            ipaddress.ip_network(self.model.config["stable_ip_cidr"])
-        except ValueError:
-            self.unit.status = BlockedStatus("Stable IP network is not valid CIDR")
-            return False
-        # TODO: Fix this logic check.
-        # hostname_found = False
-        # for hostname, p in self.bgp_parameters:
-        #     s = p["stableAddress"]
-        #     if ipaddress.ip_address(s) not in stable_ip_cidr:
-        #         self.unit.status = BlockedStatus(f"{s} is not present in {stable_ip_cidr}")
-        #         return False
-        #     if hostname == socket.get_hostname():
-        #         hostname_found = True
-        # if not hostname_found:
-        #     self.unit.status = BlockedStatus("This node has no entry in the bgp_parameters")
-        #     return False
-
-        # if self.model.config["addons"] and not self.model.config["addons_storage_class"]:
-        #     self.unit.status = BlockedStatus(
-        #         "Addons specified but missing addons_storage_class info"
-        #     )
-        #     return False
+        if self.model.config['tigera_features'].lower().contains(TigeraFeatures.EARLY_NETWORKING):
+            try:
+                ipaddress.ip_network(self.model.config["stable_ip_cidr"])
+            except ValueError:
+                self.unit.status = BlockedStatus("Stable IP network is not valid CIDR")
+                return False
 
         return True
 
@@ -337,24 +323,25 @@ class TigeraCharm(CharmBase):
             self.kubectl("create", "ns", "calico-system")
         except:
             pass
-        if not bgp_parameters:
-            self.unit.status = BlockedStatus("bgp_parameters is required.")
-            return False
+        if self.model.config['tigera_features'].lower().contains(TigeraFeatures.EARLY_NETWORKING):
+            if not bgp_parameters:
+                self.unit.status = BlockedStatus("bgp_parameters is required.")
+                return False
         
-        for node in yaml.safe_load(bgp_parameters):
-            try:
-                self.kubectl("label", "node", node['hostname'], f"rack={node['rack']}")
-            except:
-                logger.warn(f"Node labelling failed. Does {node['hostname']} exist?")
-                pass
+            # TODO: This should be handled by BGP config map (bgp-layout) - likely can be removed.
+            for node in yaml.safe_load(bgp_parameters):
+                try:
+                    self.kubectl("label", "node", node['hostname'], f"rack={node['rack']}")
+                except:
+                    logger.warn(f"Node labelling failed. Does {node['hostname']} exist?")
+                    pass
 
-        self.render_template(
-            "bgp_layout.yaml.j2",
-            "/tmp/bgp_layout.yaml",
-            bgp_parameters=self.bgp_parameters,
-        )
-        self.kubectl("apply", "-n", "tigera-operator", "-f", "/tmp/bgp_layout.yaml")
-        # self.kubectl("apply", "-n", "calico-system", "-f", "/tmp/bgp_layout.yaml")
+            self.render_template(
+                "bgp_layout.yaml.j2",
+                "/tmp/bgp_layout.yaml",
+                bgp_parameters=self.bgp_parameters,
+            )
+            self.kubectl("apply", "-n", "tigera-operator", "-f", "/tmp/bgp_layout.yaml")
 
         return True
 
@@ -510,36 +497,45 @@ class TigeraCharm(CharmBase):
         license.flush()
         self.kubectl("apply", "-f", license.name)
 
-        self.unit.status = MaintenanceStatus("Generating bgp yamls...")
-        self.configure_bgp()
+        template_kwargs = {
+            "image_registry": self.model.config["image_registry"],
+            "image_registry_secret": self.model.config["image_registry_secret"],
+            "image_path": self.model.config["image_path"],
+            "image_prefix": self.model.config["image_prefix"],
+        }
+        if self.model.config['tigera_features'].lower().contains(TigeraFeatures.EARLY_NETWORKING):
+            self.unit.status = MaintenanceStatus("Generating bgp yamls...")
 
-        self.unit.status = MaintenanceStatus("Applying Installation CRD")
+            self.configure_bgp()
+            self.unit.status = MaintenanceStatus("Applying Installation CRD")
 
-        nic_autodetection = None
-        if self.model.config["nic_autodetection_regex"]:
-            if self.model.config["nic_autodetection_skip_interface"]:
-                nic_autodetection = (
-                    f"skipIterface: ${self.model.config['nic_autodetection_regex']}"
-                )
+
+            nic_autodetection = None
+            if self.model.config["nic_autodetection_regex"]:
+                if self.model.config["nic_autodetection_skip_interface"]:
+                    nic_autodetection = (
+                        f"skipIterface: ${self.model.config['nic_autodetection_regex']}"
+                    )
+                else:
+                    nic_autodetection = f"interface: {self.model.config['nic_autodetection_regex']}"
+            elif self.model.config["nic_autodetection_cidrs"]:
+                nic_autodetection = f"cidrs: {self.model.config['nic_autodetection_cidrs'].split(',')}"
             else:
-                nic_autodetection = f"interface: {self.model.config['nic_autodetection_regex']}"
-        elif self.model.config["nic_autodetection_cidrs"]:
-            nic_autodetection = f"cidrs: {self.model.config['nic_autodetection_cidrs'].split(',')}"
-        else:
-            self.unit.status = BlockedStatus(
-                "NIC Autodetection settings are required. (nic_autodetection_* settings.)"
-            )
-            return
-
+                self.unit.status = BlockedStatus(
+                    "NIC Autodetection settings are required. (nic_autodetection_* settings.)"
+                )
+                return
+            
+            template_kwargs.update({
+                "nic_autodetection": nic_autodetection
+            })
+    
         self.render_template(
             "calico_enterprise_install.yaml.j2",
             "/tmp/calico_enterprise_install.yaml",
-            image_registry=self.model.config["image_registry"],
-            image_registry_secret=self.model.config["image_registry_secret"],
-            image_path=self.model.config["image_path"],
-            image_prefix=self.model.config["image_prefix"],
-            nic_autodetection=nic_autodetection,
+            **template_kwargs
         )
+
         self.render_template(
             "bgpconfiguration.yaml.j2",
             "/tmp/calico_bgp_configuration.yaml",

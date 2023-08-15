@@ -75,13 +75,13 @@ options:
       If tigera_version is set to "distro" and the cluster has been upgraded, then
       tigera is also upgraded if "auto_upgrade" is set to True.
       DO NOT USE THIS OPTION AS True IN PRODUCTION
-  disable_early_network:
-    default: True
-    type: boolean
+  tigera_features:
+    default: "None"
+    type: string
     description: |
-      Allow to choose if the early BGP setup happens prior to the kubernetes deployment
-      or not.
-      Moving to False is still under TESTING
+      Which Tigera Enterprise features to enable - comma-separated, currently supports:
+       - early-networking (Tigera Early Networking Feature)
+       - None
   mtu:
     default: 1500
     type: int
