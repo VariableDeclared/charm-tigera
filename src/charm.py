@@ -29,6 +29,9 @@ from ops.charm import CharmBase
 from ops.framework import StoredState
 from ops.main import main
 from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, ModelError, WaitingStatus
+from charms.prometheus_k8s.v0.prometheus_remote_write import (
+    PrometheusRemoteWriteConsumer,
+)
 
 # Log messages can be retrieved using juju debug-log
 logger = logging.getLogger(__name__)
@@ -40,7 +43,12 @@ TIGERA_DISTRO_VERSIONS = {"1.26": "3.16.1", "1.25": "3.15.2"}
 KUBECONFIG_PATH = "/root/.kube/config"
 PLUGINS_PATH = "/usr/local/bin"
 
-
+PROMETHEUS_RESOURCES = [
+    {"kind": "deployment", "name": "kube-ovn-monitor", "port": 10661},
+    {"kind": "daemonset", "name": "kube-ovn-pinger", "port": 8080},
+    {"kind": "deployment", "name": "kube-ovn-controller", "port": 10660},
+    {"kind": "daemonset", "name": "kube-ovn-cni", "port": 10665},
+]
 log = logging.getLogger(__name__)
 
 
@@ -71,6 +79,7 @@ class TigeraCharm(CharmBase):
     def __init__(self, *args):
         super().__init__(*args)
         self.jinja2_environment = Environment(loader=FileSystemLoader("templates/"))
+        self.remote_write_consumer = PrometheusRemoteWriteConsumer(self)
         self.framework.observe(self.on.install, self.on_install)
         self.framework.observe(self.on.config_changed, self.on_config_changed)
         self.framework.observe(self.on.remove, self.on_remove)
@@ -85,6 +94,10 @@ class TigeraCharm(CharmBase):
         self.stored.set_default(tigera_configured=False)
         self.stored.set_default(pod_restart_needed=False)
         self.stored.set_default(tigera_cni_configured=False)
+        self.framework.observe(
+            self.remote_write_consumer.on.endpoints_changed,
+            self.remote_write_consumer_changed,
+        )
 
         try:
             self.CTL = getContainerRuntimeCtl()
@@ -169,7 +182,38 @@ class TigeraCharm(CharmBase):
     def bgp_parameters(self):
         """Return bgp parameter as a dict."""
         return yaml.safe_load(self.model.config["bgp_parameters"])
+    
+    def remote_write_consumer_changed(self, _):
+        if self.remote_write_consumer.endpoints and self.unit.is_leader():
+            # Get the last available endpoint reported in the relation data.
+            self.apply_grafana_agent(self.remote_write_consumer.endpoints)
 
+    def apply_grafana_agent(self, remote_endpoints):
+        namespace = self.stored.grafana_namespace
+        if not self.stored.prometheus_patched:
+            self.patch_prometheus_resources(PROMETHEUS_RESOURCES, "kube-system")
+            self.stored.prometheus_patched = True
+
+        agent_config = self.render_template(
+            "grafana-configmap.yaml",
+            juju_model=self.model.name,
+            juju_model_uuid=self.model.uuid,
+            juju_app=self.model.app.name,
+            remote_endpoints=remote_endpoints,
+            namespace=namespace,
+        )
+        grafana_manifest = self.render_template(
+            "grafana-agent.yaml", juju_app=self.model.app.name, namespace=namespace
+        )
+        if self.stored.grafana_agent_configured:
+            self.kubectl("delete", "-f", grafana_manifest)
+        else:
+            self.kubectl("create", "namespace", namespace)
+
+        self.kubectl("apply", "-f", agent_config)
+        self.kubectl("apply", "-f", grafana_manifest)
+
+        self.stored.grafana_agent_configured = True
     #######################
     ### Tigera  Methods ###
     #######################
